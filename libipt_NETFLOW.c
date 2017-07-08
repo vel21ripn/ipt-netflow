@@ -91,7 +91,7 @@ static void print(const _IPT_IP *ip,
       const struct ipt_entry_target *target,
       int numeric)
 {
-	printf("NETFLOW ");
+	printf(" NETFLOW ");
 }
 
 static struct iptables_target netflow = { 
