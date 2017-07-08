@@ -39,7 +39,7 @@ struct netflow5_record {
 	__be32		last_ms;
 	__be16		s_port;
 	__be16		d_port;
-	__u8		reserved;
+	__u8		family;
 	__u8		tcp_flags;
 	__u8		protocol;
 	__u8		tos;
@@ -48,6 +48,12 @@ struct netflow5_record {
 	__u8		s_mask;
 	__u8		d_mask;
 	__u16		padding;
+} __attribute__ ((packed));
+
+struct netflow5v6_record {
+	struct netflow5_record v;
+	__be32		s_addr[3];
+	__be32		d_addr[3];
 } __attribute__ ((packed));
 
 /* NetFlow v5 packet */
@@ -61,7 +67,7 @@ struct netflow5_pdu {
 	__u8			eng_type;
 	__u8			eng_id;
 	__u16			sampling;
-	struct netflow5_record	flow[NETFLOW5_RECORDS_MAX];
+	__u8			flow[NETFLOW5_RECORDS_MAX*sizeof(struct netflow5_record)];
 } __attribute__ ((packed));
 #define NETFLOW5_HEADER_SIZE (sizeof(struct netflow5_pdu) - NETFLOW5_RECORDS_MAX * sizeof(struct netflow5_record))
 
@@ -90,6 +96,8 @@ struct netflow5_pdu {
 	two(13,  DST_MASK, destinationIPv4PrefixLength, 1) \
 	two(14,  OUTPUT_SNMP, egressInterface, 2) \
 	two(15,  IPV4_NEXT_HOP, ipNextHopIPv4Address, 4) \
+	two(16,  SRC_AS, src_AS, 2) \
+	two(17,  DST_AS, dst_AS, 2) \
 	two(21,  LAST_SWITCHED, flowEndSysUpTime, 4) \
 	two(22,  FIRST_SWITCHED, flowStartSysUpTime, 4) \
 	one(25,  minimumIpTotalLength, 2) \
@@ -149,6 +157,7 @@ struct netflow5_pdu {
 	one(200, mplsTopLabelTTL, 1) \
 	one(201, mplsLabelStackLength, 1) \
 	one(202, mplsLabelStackDepth, 1) \
+	one(207, commonPropertiesId, 4) \
 	one(208, ipv4Options, 4) \
 	one(209, tcpOptions, 4) \
 	one(225, postNATSourceIPv4Address, 4) \
@@ -331,10 +340,23 @@ struct ipt_netflow {
 	u_int32_t	flow_label; /* IPv6 */
 	u_int32_t	options; /* IPv4(16) & IPv6(32) Options */
 	u_int32_t	tcpoptions;
-#ifdef CONFIG_NF_NAT_NEEDED
+#ifdef CONFIG_NF_CONNTRACK_MARK
+        u_int32_t       mark; /* Exported as commonPropertiesId */
+#endif
 	__be32		s_as;
 	__be32		d_as;
-	struct nat_event *nat;
+#if defined(CONFIG_NF_NAT_NEEDED)
+#ifdef HAVE_HACK_MARK64
+	u_int64_t	mark64;
+#endif
+	__be32		nat_saddr;
+	__be32		nat_daddr;
+	__be16		nat_sport;
+	__be16		nat_dport;
+	u_int8_t	nat_flag,ct_dir; // 1 - snat, 2 - dnat, 4 - userid;
+#ifdef HAVE_HACK_NDPI
+	u_int32_t	ndpi_proto;
+#endif
 #endif
 	union {
 		struct list_head list; /* all flows in ipt_netflow_list */
@@ -345,28 +367,6 @@ struct ipt_netflow {
 #define flows_list  _flow_list.list
 #define flows_llnode _flow_list.llnode
 };
-
-#ifdef CONFIG_NF_NAT_NEEDED
-enum {
-	NAT_CREATE = 1, NAT_DESTROY = 2, NAT_POOLEXHAUSTED = 3
-};
-struct nat_event {
-	struct list_head list;
-	struct {
-		__be32	s_addr;
-		__be32	d_addr;
-		__be16	s_port;
-		__be16	d_port;
-	} pre, post;
-	ktime_t		ts_ktime;
-	unsigned long	ts_jiffies;
-	__u8	protocol;
-	__u8	nat_event;
-};
-#define IS_DUMMY_FLOW(nf) (nf->nat)
-#else
-#define IS_DUMMY_FLOW(nf) 0
-#endif
 
 static inline int ipt_netflow_tuple_equal(const struct ipt_netflow_tuple *t1,
 				    const struct ipt_netflow_tuple *t2)
@@ -409,37 +409,6 @@ struct netflow_aggr_p {
 	__u16 port2;
 	__u16 aggr_port;
 };
-
-#define NETFLOW_STAT_INC(count) (__get_cpu_var(ipt_netflow_stat).count++)
-#define NETFLOW_STAT_ADD(count, val) (__get_cpu_var(ipt_netflow_stat).count += (unsigned long long)val)
-#define NETFLOW_STAT_SET(count, val) (__get_cpu_var(ipt_netflow_stat).count = (unsigned long long)val)
-#define NETFLOW_STAT_TS(count)							 \
-	do {									 \
-		ktime_t kts = ktime_get_real();					 \
-		if (!(__get_cpu_var(ipt_netflow_stat)).count.first_tv64)	 \
-			__get_cpu_var(ipt_netflow_stat).count.first = kts;	 \
-		__get_cpu_var(ipt_netflow_stat).count.last = kts;		 \
-	} while (0);
-
-#define NETFLOW_STAT_INC_ATOMIC(count)				\
-	do {							\
-		preempt_disable();				\
-		(__get_cpu_var(ipt_netflow_stat).count++);	\
-		preempt_enable();				\
-	} while (0);
-
-#define NETFLOW_STAT_ADD_ATOMIC(count, val)			\
-	do {							\
-		preempt_disable();				\
-		(__get_cpu_var(ipt_netflow_stat).count += (unsigned long long)val); \
-		preempt_enable();				\
-	} while (0);
-#define NETFLOW_STAT_READ(count) ({					\
-		unsigned int _tmp = 0, _cpu;				\
-		for_each_present_cpu(_cpu)				\
-			 _tmp += per_cpu(ipt_netflow_stat, _cpu).count;	\
-		_tmp;							\
-	})
 
 struct duration {
 	ktime_t first;

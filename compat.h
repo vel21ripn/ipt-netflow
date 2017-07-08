@@ -34,25 +34,13 @@
 # define ipt_target xt_target
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,25)
-union nf_inet_addr {
-	__be32		ip;
-	__be32		ip6[4];
-	struct in_addr	in;
-	struct in6_addr	in6;
-};
-#endif
 
 #ifndef list_first_entry
 #define list_first_entry(ptr, type, member) \
 	list_entry((ptr)->next, type, member)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-# define INIT_NET(x) x
-#else
 # define INIT_NET(x) init_net.x
-#endif
 
 #ifndef ETH_P_8021AD
 # define ETH_P_8021AD	0x88A8	/* 802.1ad Service VLAN */
@@ -69,11 +57,7 @@ union nf_inet_addr {
 #endif
 
 #ifdef CONFIG_SYSCTL
-# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
-#  define BEFORE2632(x,y) x,y
-# else /* since 2.6.32 */
 #  define BEFORE2632(x,y)
-# endif
 
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(3,17,0)
 #  define ctl_table struct ctl_table
@@ -96,9 +80,6 @@ union nf_inet_addr {
 #define WARN_ONCE(x,fmt...) ({ if (x) printk(KERN_WARNING fmt); })
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,20)
-# define IPPROTO_UDPLITE 136
-#endif
 
 #ifndef time_is_before_jiffies
 # define time_is_before_jiffies(a) time_after(jiffies, a)
@@ -108,9 +89,7 @@ union nf_inet_addr {
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19)
-#  define prandom_u32 get_random_int
-# elif LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0)
+# if   LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0)
 #  define prandom_u32 random32
 #endif
 #define prandom_u32_max compat_prandom_u32_max
@@ -127,23 +106,7 @@ static inline u32 prandom_u32_max(u32 ep_ro)
 	__x == 0 ? __y : ((__y == 0) ? __x : min(__x, __y)); })
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,2,0)
-static int __ethtool_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	ASSERT_RTNL();
 
-	if (!dev->ethtool_ops->get_settings)
-		return -EOPNOTSUPP;
-
-	memset(cmd, 0, sizeof(struct ethtool_cmd));
-	cmd->cmd = ETHTOOL_GSET;
-	return dev->ethtool_ops->get_settings(dev, cmd);
-}
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
-# define ethtool_cmd_speed(x) (x)->speed
-#endif
 
 #ifndef ARPHRD_PHONET
 # define ARPHRD_PHONET		820
@@ -153,25 +116,12 @@ static int __ethtool_get_settings(struct net_device *dev, struct ethtool_cmd *cm
 # define ARPHRD_IEEE802154	804
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22)
-# define for_each_netdev_ns(net, dev) for (dev = dev_base; dev; dev = dev->next)
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-# define for_each_netdev_ns(net, d) for_each_netdev(d)
-#else
 # define for_each_netdev_ns(net, d) for_each_netdev(net, d)
-#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
-# define CHECK_FAIL	0
-# define CHECK_OK	1
-#else
 # define CHECK_FAIL	-EINVAL
 # define CHECK_OK	0
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35)
 # define use_module	ref_module
-#endif
 
 #ifndef NF_IP_LOCAL_IN /* 2.6.25 */
 # define NF_IP_PRE_ROUTING	NF_INET_PRE_ROUTING
@@ -181,110 +131,14 @@ static int __ethtool_get_settings(struct net_device *dev, struct ethtool_cmd *cm
 # define NF_IP_POST_ROUTING	NF_INET_POST_ROUTING
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19)
-/* net/netfilter/x_tables.c */
-static void xt_unregister_targets(struct xt_target *target, unsigned int n)
-{
-	unsigned int i;
-
-	for (i = 0; i < n; i++)
-		xt_unregister_target(&target[i]);
-}
-static int xt_register_targets(struct xt_target *target, unsigned int n)
-{
-	unsigned int i;
-
-	int err = 0;
-	for (i = 0; i < n; i++)
-		if ((err = xt_register_target(&target[i])))
-			goto err;
-	return err;
-err:
-	if (i > 0)
-		xt_unregister_targets(target, i);
-	return err;
-}
-#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,11,0)
 #define num_physpages	totalram_pages
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
-# ifdef ktime_to_timeval
-/* ktime_to_timeval is defined on 64bit and inline on 32bit cpu */
-/* when it's defined it calls ns_to_timeval, which is not exported */
-struct timeval portable_ns_to_timeval(const s64 nsec)
-{
-	struct timespec ts = ns_to_timespec(nsec);
-	struct timeval tv;
 
-	tv.tv_sec = ts.tv_sec;
-	tv.tv_usec = (suseconds_t) ts.tv_nsec / 1000;
 
-	return tv;
-}
-# define ns_to_timeval portable_ns_to_timeval
-# endif
 
-static inline s64 portable_ktime_to_ms(const ktime_t kt)
-{
-	struct timeval tv = ktime_to_timeval(kt);
-	return (s64) tv.tv_sec * MSEC_PER_SEC + tv.tv_usec / USEC_PER_MSEC;
-}
-# define ktime_to_ms portable_ktime_to_ms
-#endif /* before 2.6.35 */
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22)
-static inline s64 portable_ktime_to_us(const ktime_t kt)
-{
-	struct timeval tv = ktime_to_timeval(kt);
-	return (s64) tv.tv_sec * USEC_PER_SEC + tv.tv_usec;
-}
-#define ktime_to_us portable_ktime_to_us
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,26)
-static inline void put_unaligned_be16(u16 val, void *p)
-{
-	put_unaligned(cpu_to_be16(val), (__be16 *)p);
-}
-static inline void put_unaligned_be32(u32 val, void *p)
-{
-	put_unaligned(cpu_to_be32(val), (__be32 *)p);
-}
-static inline void put_unaligned_be64(u64 val, void *p)
-{
-	put_unaligned(cpu_to_be64(val), (__be64 *)p);
-}
-#endif
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,24) && !defined(RHEL_MAJOR)
-static void *__seq_open_private(struct file *f, struct seq_operations *ops,
-    int psize)
-{
-	int rc;
-	void *private;
-	struct seq_file *seq;
-
-	private = kzalloc(psize, GFP_KERNEL);
-	if (private == NULL)
-		goto out;
-
-	rc = seq_open(f, ops);
-	if (rc < 0)
-		goto out_free;
-
-	seq = f->private_data;
-	seq->private = private;
-	return private;
-
-out_free:
-	kfree(private);
-out:
-	return NULL;
-}
-#endif
 
 /* disappeared in v3.19 */
 #ifndef __get_cpu_var
@@ -580,10 +434,6 @@ out:
 }
 #endif /* IN6PTON_XDIGIT */
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,2,0)
-# define sock_create_kern(f, t, p, s) sock_create_kern(&init_net, f, t, p, s)
-#endif
-
 #if !defined(vlan_tx_tag_get) && defined(skb_vlan_tag_get)
 # define vlan_tx_tag_get skb_vlan_tag_get
 # define vlan_tx_tag_present skb_vlan_tag_present
@@ -610,10 +460,17 @@ out:
 #endif
 
 /* Offset changes made in 613dbd95723aee7abd16860745691b6c7bda20dc */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,28) && LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
-# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
-#  define xt_action_param xt_target_param
-# endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+static inline struct net *xt_net(const struct xt_action_param *par)
+{
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,19,0)
+	const struct net_device *dev = par->in;
+	if(!dev) dev = par->out;
+	return dev ? dev_net(dev): NULL;
+#else
+	return par->net;
+#endif
+}
 static inline u_int8_t xt_family(const struct xt_action_param *par)
 {
 	return par->family;
@@ -631,9 +488,26 @@ static inline unsigned int xt_hooknum(const struct xt_action_param *par)
 	return par->hooknum;
 }
 #endif
-
-#ifndef SK_CAN_REUSE
-# define SK_CAN_REUSE   1
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,12,0)
+static inline int nf_ct_is_untracked(const struct nf_conn *ct)
+{
+        return ct == NULL;
+}
 #endif
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,19,0)
+static inline int sock_create_kern_compat(struct net *net, int family, int type, int protocol, struct socket **res)
+{
+        return __sock_create(net, family, type, protocol, res, 1);
+}
+#else
+#define sock_create_kern_compat(n, f, t, p, r) sock_create_kern(n, f, t, p, r)
+#endif
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
+static inline void *PDE_DATA(const struct inode *inode)
+{
+        return PDE(inode)->data;
+}
 
+#define SK_CAN_REUSE 1
+#endif
 #endif /* COMPAT_NETFLOW_H */

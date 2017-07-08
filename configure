@@ -134,13 +134,13 @@ iptables_find_version() {
   if [ "$IPTVER" ]; then
     echo "$IPTVER (user specified)"
   else
-    IPTVER=`$IPTBIN -V 2>/dev/null | sed -n s/iptables.v//p`
-    if [ "$IPTVER" ]; then
-      echo "$IPTVER (detected from $IPTBIN)"
-      return
-    else
-      echo "no iptables binary found"
-    fi
+#    IPTVER=`$IPTBIN -V 2>/dev/null | sed -n s/iptables.v//p`
+#    if [ "$IPTVER" ]; then
+#      echo "$IPTVER (detected from $IPTBIN)"
+#      return
+#    else
+#      echo "no iptables binary found"
+#    fi
     check_pkg_config
     PKGVER=`pkg-config --modversion xtables 2>/dev/null`
     if [ "$PKGVER" ]; then
@@ -464,6 +464,7 @@ kernel_check_config() {
   kconfig CONFIG_PROC_FS		"proc interface"
   kconfig CONFIG_NF_NAT_NEEDED		"natevents"
   kconfig CONFIG_NF_CONNTRACK_EVENTS	"natevents"
+  kconfig CONFIG_NF_CONNTRACK_MARK      "connmark tracking"
   kconfig CONFIG_IPV6			"IPv6"
   kconfig CONFIG_IP6_NF_IPTABLES	"ip6tables target"
 }
