@@ -9,6 +9,10 @@ ipt_NETFLOW linux 2.6.x-4.x kernel module by <abc@telekom.ru> -- 2008-2016.
 = Detailed Feature List =
 =========================
 
+   * Support of network namespace. Compatible with kernel 3.14-4.12.
+     NAT without conntrack events (fast method). IPv6 for NetFlow v5 (hack!).
+     Incompatible options ENABLE_NAT and ENABLE_L2
+
    * High performance and scalability. For highest performance module could be
      run without conntrack being enabled in kernel. Reported to be able to
      handle 10Gbit traffic with more than 1500000 pps with negligible server

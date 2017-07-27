@@ -20,6 +20,7 @@
 
 #include <linux/module.h>
 #include <linux/ctype.h>
+#include <linux/compiler.h>
 #include <linux/skbuff.h>
 #include <linux/proc_fs.h>
 #include <linux/vmalloc.h>
@@ -63,9 +64,9 @@
 #endif
 
 
-#define HAVE_HACK_NDPI
-#undef HAVE_HACK_MARK64
-#undef DEBUG_NAT
+//#define HAVE_HACK_NDPI
+//#define HAVE_HACK_MARK64
+//#define DEBUG_NAT
 
 #ifndef ENABLE_NAT
 # undef CONFIG_NF_CONNTRACK_MARK
@@ -242,6 +243,7 @@ MODULE_PARM_DESC(snmp_rules, "SNMP-index conversion rules");
 #define NAT_FLAG_DNAT 0x2
 #define NAT_FLAG_UID  0x4
 #define NAT_FLAG_DONE 0x8
+#define NAT_FLAG_NONE 0x10
 
 static int natinfo = 1;
 module_param(natinfo, int, 0444);
@@ -738,6 +740,27 @@ static int snmp_seq_show(struct seq_file *seq, void *v)
 	return 0;
 }
 
+/*
+ * We need to close the socket if it binded to a closed network device 
+ * and open the socket after turning on the network device.
+ */
+static void event_usock(struct net_device *dev, int upown);
+
+static int netdev_event(struct notifier_block *this, unsigned long events, void *ptr)
+{
+struct netdev_notifier_info *info = ptr;
+struct net_device *dev = info->dev;
+
+if(events == NETDEV_UP || events == NETDEV_GOING_DOWN || events == NETDEV_DOWN) {
+	event_usock(dev,events == NETDEV_UP);
+}
+return 0;
+}
+
+static struct notifier_block netdev_notifier = {
+        .notifier_call = netdev_event
+};
+
 /* procfs statistics /proc/net/stat/ipt_netflow */
 static int nf_seq_show(struct seq_file *seq, void *v)
 {
@@ -753,8 +776,6 @@ static int nf_seq_show(struct seq_file *seq, void *v)
 #endif
 	int snum = 0;
 	int peak = (jiffies - n->peakflows_at) / HZ;
-	printk("%s %pK%s start\n",
-		__func__,(void *)n->net,net_eq(&init_net,n->net) ? " init_net":"");
 
 	seq_printf(seq, "ipt_NETFLOW " IPT_NETFLOW_VERSION ", srcversion %s;"
 #ifdef ENABLE_AGGR
@@ -1211,6 +1232,9 @@ static int flows_dump_seq_show(struct seq_file *seq, void *v)
 #ifdef HAVE_HACK_MARK64
 		    " mark64"
 #endif
+#ifdef CONFIG_NF_NAT_NEEDED
+		    " natflag,ip,port"
+#endif
 		    " packets bytes ts:first,last\n");
 		return 0;
 	}
@@ -1222,7 +1246,7 @@ static int flows_dump_seq_show(struct seq_file *seq, void *v)
 	    (!!inactive_needs_export(nf, i_timeout, jiffies)) | 
 	    (active_needs_export(nf, a_timeout, jiffies) << 1));
 	seq_printf(seq, " %hd,%hd",
-	    nf->tuple.i_ifc,
+	    nf->i_ifc,
 	    nf->o_ifc);
 #ifdef SNMP_RULES
 	seq_printf(seq, " %hd,%hd",
@@ -1279,6 +1303,38 @@ static int flows_dump_seq_show(struct seq_file *seq, void *v)
 	    ,nf->mark64
 #endif
 	    );
+#ifdef CONFIG_NF_NAT_NEEDED
+	if(nf->tuple.l3proto == AF_INET) 
+	{
+	char nf_buf[8];
+	u_int32_t na=0,np=0;
+	int i=0;
+	if(nf->nat_flag & NAT_FLAG_UID) {
+		nf_buf[i++] = 'U';
+		na = nf->nat_saddr;
+		np = nf->nat_sport;
+	}
+	if(nf->nat_flag & NAT_FLAG_SNAT) {
+		nf_buf[i++] = 'S';
+		na = nf->nat_saddr;
+		np = nf->nat_sport;
+	}
+	if(nf->nat_flag & NAT_FLAG_DNAT) {
+		nf_buf[i++] = 'D';
+		na = nf->nat_daddr;
+		np = nf->nat_dport;
+	}
+	if(nf->nat_flag & NAT_FLAG_NONE) {
+		nf_buf[i++] = 'N';
+	}
+	nf_buf[i++] = '\0';
+	if(i > 1 && !(nf->nat_flag & NAT_FLAG_NONE))
+		seq_printf(seq, " %s,%pI4n,%u", nf_buf,&na,np);
+	   else seq_printf(seq, " nonat");
+	} else {
+	   seq_printf(seq, " nonat");
+	}
+#endif
 	seq_printf(seq, " %u %u %lu,%lu\n",
 	    nf->nr_packets,
 	    nf->nr_bytes,
@@ -1602,8 +1658,8 @@ static int switch_promisc(struct netflow_net *n,int newpromisc)
 		dev_add_pack(&promisc_packet_type);
 	else
 		dev_remove_pack(&promisc_packet_type);
-	printk(KERN_INFO "ipt_NETFLOW: promisc hack is %s\n",
-	    newpromisc? "enabled" : "disabled");
+	printk(KERN_INFO "ipt_NETFLOW: netid:%d promisc hack is %s\n",
+			n->id, newpromisc? "enabled" : "disabled");
 	n->promisc = newpromisc;
 unlock:
 	mutex_unlock(&n->promisc_lock);
@@ -1944,7 +2000,6 @@ ctl_table *r;
 #ifdef CONFIG_NF_NAT_NEEDED
 	DEF_SYSCTL_REC("natinfo",0644,&n->natinfo,sizeof(int),&proc_dointvec);
 #endif
-	printk("%s: sysctl %d\n",__func__,i);
 	return nst;
 bad_news:
 	printk("%s: too many sysctl %d >= %d\n",__func__,i,NST_SIZE);
@@ -1983,8 +2038,10 @@ static struct socket *usock_open_sock(struct net *net, struct ipt_netflow_sock *
 	int error;
 	int salen = 0;
 
+	usock->bind_ifindex = 0;
 	if ((error = sock_create_kern_compat(net, usock->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP, &sock)) < 0) {
-		printk(KERN_ERR "ipt_NETFLOW: sock_create_kern error %d\n", -error);
+		printk(KERN_ERR "ipt_NETFLOW: netid:%d sock_create_kern error %d\n",
+				n->id, -error);
 		return NULL;
 	}
 	sock->sk->sk_allocation = GFP_ATOMIC;
@@ -1999,8 +2056,8 @@ static struct socket *usock_open_sock(struct net *net, struct ipt_netflow_sock *
 			sock->sk->sk_bound_dev_if = dev->ifindex;
 			dev_put(dev);
 		} else {
-			printk(KERN_ERR "ipt_NETFLOW: error binding to device %s, errno %d\n",
-			    usock->sdev, -error);
+			printk(KERN_ERR "ipt_NETFLOW: netid:%d error binding to device %s, errno %d\n",
+			    n->id, usock->sdev, -error);
 			return NULL;
 		}
 	}
@@ -2009,8 +2066,9 @@ static struct socket *usock_open_sock(struct net *net, struct ipt_netflow_sock *
 			salen = sizeof(struct sockaddr_in);
 		else if (usock->saddr.ss_family == AF_INET6)
 			salen = sizeof(struct sockaddr_in6);
-		if ((error = sock->ops->bind(sock, (struct sockaddr *)&usock->saddr, salen)) < 0) {
-			printk(KERN_ERR "ipt_NETFLOW: error binding socket %d\n", -error);
+		if ((error = kernel_bind(sock, (struct sockaddr *)&usock->saddr, salen)) < 0) {
+			printk(KERN_ERR "ipt_NETFLOW: netid:%d error binding socket %d\n",
+					n->id, -error);
 			return NULL;
 		}
 	}
@@ -2019,13 +2077,26 @@ static struct socket *usock_open_sock(struct net *net, struct ipt_netflow_sock *
 		sock->sk->sk_sndbuf = n->sndbuf;
 	else
 		n->sndbuf = sock->sk->sk_sndbuf;
-	error = sock->ops->connect(sock, (struct sockaddr *)&usock->addr, sizeof(usock->addr), 0);
+	error = kernel_connect(sock, (struct sockaddr *)&usock->addr, sizeof(usock->addr), 0);
 	if (error < 0) {
-		printk(KERN_ERR "ipt_NETFLOW: error connecting UDP socket %d,"
-		    " don't worry, will try reconnect later.\n", -error);
+		printk(KERN_ERR "ipt_NETFLOW: netid:%d error connecting UDP socket %d,"
+		    " don't worry, will try reconnect later.\n", n->id, -error);
 		/* ENETUNREACH when no interfaces */
 		sock_release(sock);
 		return NULL;
+	}
+	{
+	    struct dst_entry *dst = sk_dst_get(sock->sk);
+	    if(dst) {
+		usock->bind_ifindex = dst->dev->ifindex;
+		if(debug)
+			printk(KERN_INFO "ipt_NETFLOW: netid:%d socket bind %d %s\n",
+						n->id, usock->bind_ifindex, dst->dev->name);
+		dst_release(dst);
+	    } else {
+		printk(KERN_ERR "ipt_NETFLOW: netid:%d no binding for dst %s\n",
+				    n->id, print_sockaddr(&usock->addr));
+	    }
 	}
 	return sock;
 }
@@ -2052,9 +2123,53 @@ static void usock_connect(struct net *net, struct ipt_netflow_sock *usock, const
 
 static inline void usock_close(struct ipt_netflow_sock *usock)
 {
-	if (usock->sock)
-		sock_release(usock->sock);
+	struct socket *sock = usock->sock;
+	if (sock) {
+		kernel_sock_shutdown(sock, SHUT_RDWR);
+		sock_release(sock);
+	}
 	usock->sock = NULL;
+}
+
+static void event_usock(struct net_device *dev,int updown) // updown: 1 - UP
+{
+struct net *net = dev_net(dev);
+struct netflow_net *n = netflow_pernet(net);
+struct ipt_netflow_sock *usock;
+
+	mutex_lock(&n->sock_lock);
+	list_for_each_entry(usock, &n->usock_list, list) {
+		if(usock->bind_ifindex == dev->ifindex) break;
+	}
+	mutex_unlock(&n->sock_lock);
+	if(!usock || usock->bind_ifindex != dev->ifindex) return;
+
+	if(debug)
+		printk(KERN_INFO "%s: netid:%d dev %s %s\n",__func__,
+					n->id,dev->name,updown ? "UP":"DOWN");
+
+	if(!usock->sock && updown) { // reopen socket
+		usock->sock = usock_open_sock(net, usock);
+		if(!usock->sock) {
+			usock->err_connect++;
+		} else {
+			atomic_set(&usock->wmem_peak, 0);
+			usock->err_full = 0;
+			usock->err_other = 0;
+		}
+		if (debug)
+			printk(KERN_INFO
+				"ipt_NETFLOW: netid:%d %s reopen socket by event: %s\n",
+					n->id, print_sockaddr(&usock->addr),
+					usock->sock ? "Success":"Failed");
+	}
+	if(usock->sock && !updown) { // close socket
+		if (debug)
+			printk(KERN_INFO "ipt_NETFLOW: netid:%d %s close socket by event\n",
+			    n->id, print_sockaddr(&usock->addr));
+		usock_close(usock);
+	}
+
 }
 
 ktime_t ktime_get_real(void);
@@ -2082,11 +2197,11 @@ static void netflow_sendmsg(struct net *net, void *buffer, const int len)
 			continue;
 		}
 		if (debug)
-			printk(KERN_INFO "netflow_sendmsg: sendmsg(%d, %d) [%u %u] net %pK\n",
+			printk(KERN_INFO "netflow_sendmsg: sendmsg(%d, %d) [%u %u] netid:%d\n",
 			       snum,
 			       len,
 			       atomic_read(&usock->sock->sk->sk_wmem_alloc),
-			       usock->sock->sk->sk_sndbuf, (void *)net);
+			       usock->sock->sk->sk_sndbuf, n->id);
 		ret = kernel_sendmsg(usock->sock, &msg, &iov, 1, (size_t)len);
 		if (ret < 0) {
 			char *suggestion = "";
@@ -2167,8 +2282,8 @@ static void add_usock(struct netflow_net *n,struct ipt_netflow_sock *usock)
 		}
 	}
 	list_add_tail(&usock->list, &n->usock_list);
-	printk(KERN_INFO "ipt_NETFLOW: added destination %s%s\n",
-	       print_usock_addr(usock),
+	printk(KERN_INFO "ipt_NETFLOW: netid:%d added destination %s%s\n",
+	       n->id, print_usock_addr(usock),
 	       (!usock->sock)? " (unconnected)" : "");
 	mutex_unlock(&n->sock_lock);
 }
@@ -2742,7 +2857,7 @@ static void netflow_export_flow_v5(struct netflow_net *n, struct ipt_netflow *nf
 	rec->i_ifc	= htons(nf->i_ifcr);
 	rec->o_ifc	= htons(nf->o_ifcr);
 #else
-	rec->i_ifc	= htons(nf->tuple.i_ifc);
+	rec->i_ifc	= htons(nf->i_ifc);
 	rec->o_ifc	= htons(nf->o_ifc);
 #endif
 	rec->nr_packets = htonl(nf->nr_packets);
@@ -2759,28 +2874,31 @@ static void netflow_export_flow_v5(struct netflow_net *n, struct ipt_netflow *nf
 	rec->d_as	= nf->d_as;
 	rec->nexthop    = nf->nh.ip;
 #else
-	if(rec->family == AF_INET && (nf->nat_flag & (NAT_FLAG_DNAT|NAT_FLAG_SNAT))) {
-		if(debug) {
+	if(rec->family == AF_INET) {
+		if(debug > 1) {
 		    printk(KERN_INFO "export flow p:%d src:%pI4:%u dst:%pI4:%u %s%s%s snat:%pI4:%u dnat:%pI4:%u\n",
 			rec->protocol,
 			&rec->s_addr,htons(rec->s_port),
 			&rec->d_addr,htons(rec->d_port),
-			nf->ct_dir       ? " REV":" DIR",
-			nf->nat_flag & 1 ? " SNAT":"",
-			nf->nat_flag & 2 ? " DNAT":"",
+			(nf->ct_dir-1)   ? " REV":" DIR",
+			nf->nat_flag & NAT_FLAG_SNAT ? " SNAT":"",
+			nf->nat_flag & NAT_FLAG_DNAT ? " DNAT":"",
 			&nf->nat_saddr,htons(nf->nat_sport),
 			&nf->nat_daddr,htons(nf->nat_dport));
 		}
 		rec->nexthop = get_nat_addr(nf);
 		rec->s_as = get_nat_port(nf);
-		rec->d_as = htons(nf->nat_flag << 1);
+		rec->d_as = htons((nf->nat_flag << 2) | nf->ct_dir);
 	} else {
 		rec->nexthop = 0;
 		rec->s_as = 0;
-		rec->d_as = 0;
+		rec->d_as = htons((NAT_FLAG_NONE << 2) | nf->ct_dir);
 	}
-	if(nf->nat_flag & NAT_FLAG_DONE)
-		rec->d_as |= htons(nf->ct_dir);
+	if(nf->ct_dir == 2 && rec->protocol == IPPROTO_ICMP) {
+		// swap code and id for icmp reply
+		rec->s_port	= nf->tuple.d_port;
+		rec->d_port	= nf->tuple.s_port;
+	}
 #endif
 	rec->s_mask	= nf->s_mask;
 	rec->d_mask	= nf->d_mask;
@@ -3653,7 +3771,7 @@ static inline void add_tpl_field(struct netflow_net *n,
 #else
 	case IPV4_NEXT_HOP:  put_unaligned(get_nat_addr(nf), (__be32 *)ptr); break;
 	case SRC_AS:         put_unaligned_be16(get_nat_port(nf), ptr); break;
-	case DST_AS:         put_unaligned_be16((nf->nat_flag << 1) | nf->ct_dir, ptr); break;
+	case DST_AS:         put_unaligned_be16((nf->nat_flag << 2) | nf->ct_dir, ptr); break;
 #endif
 	case L4_SRC_PORT:    put_unaligned(nf->tuple.s_port, (__be16 *)ptr); break;
 	case L4_DST_PORT:    put_unaligned(nf->tuple.d_port, (__be16 *)ptr); break;
@@ -3661,7 +3779,7 @@ static inline void add_tpl_field(struct netflow_net *n,
 	case INPUT_SNMP:     put_unaligned_be16(nf->i_ifcr, ptr); break;
 	case OUTPUT_SNMP:    put_unaligned_be16(nf->o_ifcr, ptr); break;
 #else
-	case INPUT_SNMP:     put_unaligned_be16(nf->tuple.i_ifc, ptr); break;
+	case INPUT_SNMP:     put_unaligned_be16(nf->i_ifc, ptr); break;
 	case OUTPUT_SNMP:    put_unaligned_be16(nf->o_ifc, ptr); break;
 #endif
 #ifdef ENABLE_PHYSDEV
@@ -4381,56 +4499,6 @@ static void netflow_switch_version(struct netflow_net *n, const int ver)
 }
 
 
-#if 0
-static void export_nat_event(struct netflow_net *n, struct nat_event *nel)
-{
-	static struct ipt_netflow nf = { { NULL } };
-
-	nf.tuple.l3proto = AF_INET;
-	nf.tuple.protocol = nel->protocol;
-	nf.nat = nel; /* this is also flag of dummy flow */
-	nf.tcp_flags = (nel->nat_event == NAT_DESTROY)? TCP_FIN_RST : TCP_SYN_ACK;
-	if (n->protocol >= 9) {
-		nf.nf_ts_obs = nel->ts_ktime;
-		nf.tuple.src.ip = nel->pre.s_addr;
-		nf.tuple.dst.ip = nel->pre.d_addr;
-		nf.tuple.s_port = nel->pre.s_port;
-		nf.tuple.d_port = nel->pre.d_port;
-		netflow_export_flow(n, &nf);
-	} else { /* v5 */
-		/* The weird v5 packet(s).
-		 * src and dst will be same as in data flow from the FORWARD chain
-		 * where src is pre-nat src ip and dst is post-nat dst ip.
-		 * What we lacking here is external src ip for SNAT, or
-		 * pre-nat dst ip for DNAT. We will put this into Nexthop field
-		 * with port into src/dst AS field. tcp_flags will distinguish it's
-		 * start or stop event. Two flows in case of full nat. */
-		nf.tuple.src.ip = nel->pre.s_addr;
-		nf.tuple.s_port = nel->pre.s_port;
-		nf.tuple.dst.ip = nel->post.d_addr;
-		nf.tuple.d_port = nel->post.d_port;
-
-		nf.nf_ts_first = nel->ts_jiffies;
-		nf.nf_ts_last  = nel->ts_jiffies;
-		if (nel->pre.s_addr != nel->post.s_addr ||
-		    nel->pre.s_port != nel->post.s_port) {
-			nf.nh.ip = nel->post.s_addr;
-			nf.s_as  = nel->post.s_port;
-			nf.d_as  = 0;
-			netflow_export_flow(n, &nf);
-		}
-		if (nel->pre.d_addr != nel->post.d_addr ||
-		    nel->pre.d_port != nel->post.d_port) {
-			nf.nh.ip = nel->pre.d_addr;
-			nf.s_as  = 0;
-			nf.d_as  = nel->pre.d_port;
-			netflow_export_flow(n, &nf);
-		}
-	}
-	kfree(nel);
-}
-#endif /* CONFIG_NF_NAT_NEEDED */
-
 static inline int active_needs_export(const struct ipt_netflow *nf, const long a_timeout,
     const unsigned long j)
 {
@@ -4895,59 +4963,71 @@ static void parse_l2_header(const struct sk_buff *skb, struct ipt_netflow_tuple 
 #if defined(CONFIG_NF_CONNTRACK_MARK) || defined(CONFIG_NF_NAT_NEEDED)
 
 #ifdef DEBUG_NAT
-static int _dump_x1_f[2]={4,4};
-
 static void _dump_x1(const struct nf_conntrack_tuple *t,
-		const struct nf_conntrack_tuple *rt,struct ipt_netflow *nf) {
-	if(! _dump_x1_f[nf->ct_dir & 1]) return;
-	_dump_x1_f[nf->ct_dir & 1]--;
-	printk(KERN_INFO "%4s %2d %4s%4s src %pI4:%d dst %pI4:%d\n",
-		nf->ct_dir & 1 ? "REPL":"ORIG",
+		const struct nf_conntrack_tuple *rt,struct ipt_netflow *nf,
+		int ctstatus,const char *msg) {
+
+	printk(KERN_INFO "%4s %2d   src %pI4:%d dst %pI4:%d %s%s%s%s %x %u %s\n",
+		nf->ct_dir & 2 ? "REPL":"ORIG",
 		nf->tuple.protocol,
+		&nf->tuple.src.ip,htons(nf->tuple.s_port),
+		&nf->tuple.dst.ip,htons(nf->tuple.d_port),
 		nf->nat_flag & NAT_FLAG_SNAT ? " SNAT":"",
 		nf->nat_flag & NAT_FLAG_DNAT ? " DNAT":"",
-		&nf->tuple.src.ip,htons(nf->tuple.s_port),
-		&nf->tuple.dst.ip,htons(nf->tuple.d_port));
-	printk(KERN_INFO "%-16s src %pI4:%d dst %pI4:%d\n", "tuple dir",
+		nf->nat_flag & NAT_FLAG_UID  ? " UID ":"",
+		nf->nat_flag & NAT_FLAG_DONE ? " DONE":"",
+		ctstatus,
+		nf->nr_packets,
+		msg
+	      );
+	if(t)
+	  printk(KERN_INFO "%-10s src %pI4:%d dst %pI4:%d\n", "tuple dir",
 		&t->src.u3.ip,htons(t->src.u.all),
 		&t->dst.u3.ip,htons(t->dst.u.all));
-	printk(KERN_INFO "%-16s src %pI4:%d dst %pI4:%d\n", "tuple rev",
+	if(rt)
+	  printk(KERN_INFO "%-10s src %pI4:%d dst %pI4:%d\n", "tuple rev",
 		&rt->src.u3.ip,htons(rt->src.u.all),
 		&rt->dst.u3.ip,htons(rt->dst.u.all));
 }
 #endif
 
-static void detect_nat(struct ipt_netflow *nf,struct nf_conn * ct) {
+static void detect_nat(struct netflow_net *n,
+		struct ipt_netflow *nf,
+		struct nf_conn * ct) {
 	const struct nf_conntrack_tuple *t,*rt;
+
+	if(!(nf->tuple.protocol == IPPROTO_ICMP ||
+	     nf->tuple.protocol == IPPROTO_TCP ||
+	     nf->tuple.protocol == IPPROTO_UDP ||
+	     nf->tuple.protocol == IPPROTO_SCTP ||
+	     nf->tuple.protocol == IPPROTO_DCCP ||
+	     nf->tuple.protocol == IPPROTO_UDPLITE)) {
+		nf->nat_flag |= NAT_FLAG_DONE|NAT_FLAG_NONE;
+		return;
+	}
 
 	t  = nf_ct_tuple(ct,IP_CT_DIR_ORIGINAL);
 	rt = nf_ct_tuple(ct,IP_CT_DIR_REPLY);
-	switch(t->dst.protonum) {
-        case IPPROTO_ICMP:
-        case IPPROTO_TCP:
-        case IPPROTO_UDP:
-        case IPPROTO_UDPLITE:
-        case IPPROTO_SCTP:
-        case IPPROTO_DCCP:
 
-		if (!(ct->status & (IPS_SRC_NAT | IPS_DST_NAT)))
-			return;
-
-		if ( test_bit(IPS_SRC_NAT_BIT,  &ct->status)) {
-			nf->nat_saddr = rt->dst.u3.ip;
-			nf->nat_sport = t->dst.protonum != IPPROTO_ICMP ? rt->dst.u.all:0;
-			nf->nat_flag |= NAT_FLAG_SNAT;
-		}
-		if ( test_bit(IPS_DST_NAT_BIT,  &ct->status)) {
-			nf->nat_daddr = t->dst.u3.ip;
-			nf->nat_dport = t->dst.protonum != IPPROTO_ICMP ? t->dst.u.all:0;
-			nf->nat_flag |= NAT_FLAG_DNAT;
-		}
-#ifdef DEBUG_NAT
-		_dump_x1(t,rt,nf);
-#endif
-		return;
+	if (!(nf->nat_flag & NAT_FLAG_DNAT) &&
+			test_bit(IPS_DST_NAT_BIT,  &ct->status)) {
+		nf->nat_daddr = t->dst.u3.ip;
+		nf->nat_dport = t->dst.protonum != IPPROTO_ICMP ? t->dst.u.all:0;
+		nf->nat_flag |= NAT_FLAG_DNAT;
 	}
+
+	if (rt && !(nf->nat_flag & NAT_FLAG_SNAT) &&
+			test_bit(IPS_SRC_NAT_BIT,  &ct->status)) {
+		nf->nat_saddr = rt->dst.u3.ip;
+		nf->nat_sport = t->dst.protonum != IPPROTO_ICMP ? rt->dst.u.all:0;
+		nf->nat_flag |= NAT_FLAG_SNAT;
+	}
+	if((ct->status & (IPS_ASSURED | IPS_SEEN_REPLY)) != 0 || nf->nr_packets > 1)
+		nf->nat_flag |= NAT_FLAG_DONE;
+#ifdef DEBUG_NAT
+	if(debug > 1 ) 
+		_dump_x1(t,rt,nf,ct->status,"stop");
+#endif
 }
 #endif
  
@@ -5007,7 +5087,14 @@ static unsigned int netflow_target(
 		tuple.i_ifc = skb->nf_bridge->physindev->ifindex;
 	else /* FALLTHROUGH */
 #endif
+
+#ifdef ENABLE_L2
+#ifndef CONFIG_NF_NAT_NEEDED
 	tuple.i_ifc	= if_in? if_in->ifindex : -1;
+#else
+# warn Can not use NAT and L2
+#endif
+#endif
 	tcp_flags	= 0;
 	s_mask		= 0;
 	d_mask		= 0;
@@ -5021,7 +5108,7 @@ static unsigned int netflow_target(
 		fragment	= unlikely(iph->ip.frag_off & htons(IP_OFFSET));
 		ptr		= iph->ip.ihl * 4;
 		pkt_len		= ntohs(iph->ip.tot_len);
-
+		
 #define IPHDR_MAXSIZE (4 * 15)
 		if (unlikely(iph->ip.ihl * 4 > sizeof(struct iphdr))) {
 			u_int8_t _opt[IPHDR_MAXSIZE - sizeof(struct iphdr)];
@@ -5134,8 +5221,9 @@ do_protocols:
 			if (likely(family == AF_INET) &&
 				    likely(hp = skb_header_pointer(skb, ptr, 2, &_hdr))) {
 				tuple.d_port = htons((hp->type << 8) | hp->code);
-				if(hp->type == ICMP_ECHO || hp->type == ICMP_ECHOREPLY)
+				if(hp->type == ICMP_ECHO || hp->type == ICMP_ECHOREPLY) {
 					tuple.s_port = hp->un.echo.id;
+				}
 			}
 			break;
 		    }
@@ -5269,6 +5357,7 @@ do_protocols:
 #endif
 		nf->nf_ts_first = jiffies;
 		nf->tcp_flags = tcp_flags;
+		nf->i_ifc = if_in?  if_in->ifindex : -1;
 		nf->o_ifc = if_out? if_out->ifindex : -1;
 #ifdef ENABLE_PHYSDEV_OVER
 		if (skb->nf_bridge && skb->nf_bridge->physoutdev)
@@ -5325,7 +5414,7 @@ do_protocols:
 		if (unlikely(debug > 2))
 			printk(KERN_INFO "ipt_NETFLOW: new (%u) %hd:%hd SRC=%u.%u.%u.%u:%u DST=%u.%u.%u.%u:%u\n",
 			       atomic_read(&ipt_netflow_count),
-			       tuple.i_ifc, nf->o_ifc,
+			       nf->i_ifc, nf->o_ifc,
 			       NIPQUAD(tuple.src.ip), ntohs(tuple.s_port),
 			       NIPQUAD(tuple.dst.ip), ntohs(tuple.d_port));
 #endif
@@ -5334,37 +5423,35 @@ do_protocols:
 #ifdef HAVE_HACK_MARK64
 	if(!nf->mark64)
 		nf->mark64 = skb->userid;
-	}
 #endif
 #ifdef CONFIG_NF_NAT_NEEDED
-	if(n->natinfo && (nf->nat_flag & NAT_FLAG_DONE) == 0) {
+	if(n->natinfo && family == AF_INET && !(nf->nat_flag & NAT_FLAG_DONE)) {
 		struct nf_conn *ct;
 		enum ip_conntrack_info ctinfo;
 		ct = nf_ct_get(skb, &ctinfo);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,12,0)
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(4,12,0)
 		// for nf_ct_is_untracked()
-		if(ctinfo == IP_CT_UNTRACKED) {
-#else
-		if(ct && !nf_ct_is_untracked(ct)) {
-#endif
-			nf->nat_flag |= NAT_FLAG_DONE;
+		if(ctinfo == IP_CT_UNTRACKED)
+# else
+		if(!ct || (ct && nf_ct_is_untracked(ct)))
+# endif
+		{
+			nf->nat_flag |= NAT_FLAG_DONE|NAT_FLAG_NONE;
 		} else {
-#ifdef CONFIG_NF_CONNTRACK_MARK
+# ifdef CONFIG_NF_CONNTRACK_MARK
 			if (ct) nf->mark = ct->mark;
-#endif
-			if (!nf->nat_flag && (ct->status & (IPS_ASSURED | IPS_SEEN_REPLY))) {
-				nf->ct_dir = CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY;
-				detect_nat(nf,ct);
-#ifdef HAVE_HACK_MARK64
-                		if((nf->mark64 & 0xffff000000000000ull) 
-					      == 0xdead000000000000ull) {
-		                	nf->nat_saddr  = nf->mark64 & 0xffffffff;
-                			nf->nat_sport  = htons((nf->mark64 >> 32) & 0xffff);
-		                	nf->nat_flag |= NAT_FLAG_UID;
-		                }
-#endif
-				nf->nat_flag |= NAT_FLAG_DONE;
-        		}
+# endif
+			if(!nf->ct_dir)
+				nf->ct_dir = (CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY)+1 ;
+# ifdef HAVE_HACK_MARK64
+                	if((nf->mark64 & 0xffff000000000000ull) 
+				      == 0xdead000000000000ull) {
+		               	nf->nat_saddr  = nf->mark64 & 0xffffffff;
+                		nf->nat_sport  = htons((nf->mark64 >> 32) & 0xffff);
+		               	nf->nat_flag |= NAT_FLAG_UID | NAT_FLAG_DONE;
+		        }
+# endif
+			detect_nat(n, nf, ct);
 		}
 	}
 #endif
@@ -5471,7 +5558,7 @@ static int register_stat(struct proc_dir_entry *parent,
 # if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
 	proc_stat->proc_fops = fops;
 # endif
-	printk(KERN_INFO "netflow: registered: /proc/net/stat/%s\n", name);
+	if(debug) printk(KERN_INFO "netflow: registered: /proc/net/stat/%s\n", name);
 	return 1;
 }
 #else
@@ -5503,7 +5590,7 @@ static int __net_init netflow_net_init(struct net *net)
 	n->id = ++netns_count;
 	printk(KERN_INFO "net:%pK%s id:%d\n",(void *)net,net_eq(&init_net,net) ? "(init_net)":"",n->id);
 	snprintf(str_id,sizeof(str_id)-1,"%s netid:%d: ", __func__,n->id);
-	printk(KERN_INFO "%s enter\n",str_id);
+	printk(KERN_INFO "%s\n",str_id);
 
 	/* init */
 
@@ -5567,7 +5654,7 @@ static int __net_init netflow_net_init(struct net *net)
 		spin_lock_init(&n->htable_stripes[i].lock);
 		INIT_LIST_HEAD(&n->htable_stripes[i].list);
 	}
-	printk(KERN_INFO "%s static init OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s static init OK\n",str_id);
 /*******************************************************************************/
 
 	n->ipt_netflow_stat = alloc_percpu(struct ipt_netflow_stat);
@@ -5611,11 +5698,11 @@ static int __net_init netflow_net_init(struct net *net)
 		printk(KERN_ERR "%s netflow: can't register to sysctl\n",str_id);
 		goto err_free_sysctl_tbl;
 	} else
-		printk(KERN_INFO "%s netflow: registered: sysctl net.netflow\n",str_id);
+		if(debug) printk(KERN_INFO "%s netflow: registered: sysctl net.netflow\n",str_id);
 #endif
 
 	if (add_destinations(net) < 0) {
-		printk(KERN_INFO "%s add_destinations FAILED\n",str_id);
+		printk(KERN_ERR "%s add_destinations FAILED\n",str_id);
 		goto err_free_sysctl;
 	}
 
@@ -5644,16 +5731,14 @@ static int __net_init netflow_net_init(struct net *net)
 #endif
 	netflow_switch_version(n,n->protocol);
 	_schedule_scan_worker(n,0);
-	printk(KERN_INFO "%s _schedule_scan_worker\n",str_id);
 	setup_timer(&n->rate_timer, rate_timer_calc, (unsigned long)n);
 	mod_timer(&n->rate_timer, jiffies + (HZ * SAMPLERATE));
-	printk(KERN_INFO "%s mod_timer\n",str_id);
 
 	n->peakflows_at = jiffies;
 
 	clear_ipt_netflow_stat(n);
 
-	printk(KERN_INFO "%s ipt_NETFLOW is loaded\n",str_id);
+	printk(KERN_INFO "%s Success!\n",str_id);
 	return 0;
 
 err_free_sysctl:
@@ -5689,53 +5774,53 @@ static void __net_exit netflow_net_exit(struct net *net)
         n = netflow_pernet(net);
 	if(!n) return;
 	snprintf(str_id,sizeof(str_id)-1,"%s netid:%d ", __func__,n->id);
-	printk(KERN_INFO "%s enter\n",str_id);
+	printk(KERN_INFO "%s\n",str_id);
 
 	destination_removeall(n);
-	printk(KERN_INFO "%s destination_removeall OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s destination_removeall OK\n",str_id);
 
 #ifdef CONFIG_SYSCTL
 	unregister_net_sysctl_table(n->netflow_sysctl_header);
-	printk(KERN_INFO "%s unregister_net_sysctl_table OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s unregister_net_sysctl_table OK\n",str_id);
 	vfree(n->sysctl_table);
-	printk(KERN_INFO "%s vfree sysctl_table OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s vfree sysctl_table OK\n",str_id);
 #endif
 #ifdef CONFIG_PROC_FS
 	remove_proc_entry("ipt_netflow_flows", net->proc_net_stat);
-	printk(KERN_INFO "%s remove_proc_entry ipt_netflow_flows OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s remove_proc_entry ipt_netflow_flows OK\n",str_id);
 	remove_proc_entry("ipt_netflow_snmp", net->proc_net_stat);
-	printk(KERN_INFO "%s remove_proc_entry ipt_netflow_snmp OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s remove_proc_entry ipt_netflow_snmp OK\n",str_id);
 	remove_proc_entry("ipt_netflow", net->proc_net_stat);
-	printk(KERN_INFO "%s remove_proc_entry ipt_netflow OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s remove_proc_entry ipt_netflow OK\n",str_id);
 #endif
 #ifdef ENABLE_PROMISC
 	switch_promisc(n,0);
-	printk(KERN_INFO "%s switch_promisc(0) OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s switch_promisc(0) OK\n",str_id);
 #endif
 	_unschedule_scan_worker(n);
-	printk(KERN_INFO "%s _unschedule_scan_worker OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s _unschedule_scan_worker OK\n",str_id);
 	netflow_scan_and_export(net,AND_FLUSH);
-	printk(KERN_INFO "%s netflow_scan_and_export OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s netflow_scan_and_export OK\n",str_id);
 	del_timer_sync(&n->rate_timer);
-	printk(KERN_INFO "%s del_timer_sync OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s del_timer_sync OK\n",str_id);
 
 	synchronize_sched();
 
 	free_templates(n);
-	printk(KERN_INFO "%s free_templates OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s free_templates OK\n",str_id);
 #ifdef ENABLE_AGGR
 	aggregation_remove(n, &n->aggr_n_list);
-	printk(KERN_INFO "%s aggregation_remove aggr_n_list OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s aggregation_remove aggr_n_list OK\n",str_id);
 	aggregation_remove(n, &n->aggr_p_list);
-	printk(KERN_INFO "%s aggregation_remove aggr_p_list OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s aggregation_remove aggr_p_list OK\n",str_id);
 #endif
 #ifdef SNMP_RULES
 	kfree(n->snmp_ruleset);
-	printk(KERN_INFO "%s free snmp_ruleset OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s free snmp_ruleset OK\n",str_id);
 #endif
 
 	vfree(n->htable);
-	printk(KERN_INFO "%s free htable OK\n",str_id);
+	if(debug) printk(KERN_INFO "%s free htable OK\n",str_id);
 	free_percpu(n->ipt_netflow_stat);
 	printk(KERN_INFO "%s %pK%s id:%d success.\n",__func__,
 			(void *)net,net_eq(&init_net,net) ? " init_net":"",n->id);
@@ -5751,7 +5836,7 @@ static int __init ipt_netflow_init(void)
 		"ipt_NETFLOW " IPT_NETFLOW_VERSION " %s", THIS_MODULE->srcversion);
 	tpl_element_sizes[observationDomainName] = version_string_size + 1;
 
-	printk(KERN_INFO "ipt_NETFLOW v5_size %zu v5_6 %zu\n",
+	printk(KERN_INFO "ipt_NETFLOW v5_size %zu v5_ipv6 %zu\n",
 		sizeof(struct netflow5_record),sizeof(struct netflow5v6_record));
 
 	start_ts.first = ktime_get_real();
@@ -5826,12 +5911,16 @@ static int __init ipt_netflow_init(void)
 		xt_unregister_targets(ipt_netflow_reg, ARRAY_SIZE(ipt_netflow_reg));
 		return -EBUSY;
 	}
+	register_netdevice_notifier(&netdev_notifier);
+	printk(KERN_INFO "ipt_NETFLOW loaded.\n");
 	return 0;
 }
 
 static void __exit ipt_netflow_fini(void)
 {
 	printk(KERN_INFO "ipt_NETFLOW unloading..\n");
+
+	unregister_netdevice_notifier(&netdev_notifier);
 	xt_unregister_targets(ipt_netflow_reg, ARRAY_SIZE(ipt_netflow_reg));
 	unregister_pernet_subsys(&nfid_net_ops);
 	kmem_cache_destroy(ipt_netflow_cachep);

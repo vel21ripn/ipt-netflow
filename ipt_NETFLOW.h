@@ -305,6 +305,7 @@ struct ipt_netflow {
 #if defined(ENABLE_MAC) || defined(ENABLE_VLAN)
 	__be16		ethernetType; /* Network byte order */
 #endif
+	__u16		i_ifc;
 	__u16		o_ifc;
 #ifdef ENABLE_PHYSDEV
 	__u16		i_ifphys;
@@ -380,6 +381,7 @@ struct ipt_netflow_sock {
 	struct sockaddr_storage addr;	// destination
 	struct sockaddr_storage saddr;	// source
 	char   sdev[IFNAMSIZ];		// source device
+	int    bind_ifindex;		// source device ifindex
 	atomic_t wmem_peak;		// sk_wmem_alloc peak value
 	unsigned int err_connect;	// connect errors
 	unsigned int err_full;		// socket filled error
