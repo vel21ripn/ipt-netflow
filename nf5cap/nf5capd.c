@@ -24,6 +24,11 @@
 #include <net/if.h>
 #include <netinet/ip_icmp.h>
 
+/* the Lua interpreter */
+#include <lua.h>
+#include <lualib.h>
+#include <lauxlib.h>
+
 #define __INLINE__  inline
 
 #include "avl.h"
@@ -39,11 +44,20 @@ int c_time = -1;
 char *startScript=NULL;
 char *stopScript=NULL;
 char *condition=NULL;
+char *luascript=NULL;
+char *luaconf=NULL;
+static int luadebug=0;
 time_t tm=0,tm_dump=0,last_time = 0,dump_time=0;
 
 struct sockaddr_in bind_addr;
 
 static int ndpi_init_ok = 0;
+static int lua_init_ok = 0;
+static lua_State* lLUA = NULL;
+
+static pthread_mutex_t mutex_lua = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK_LUA pthread_mutex_lock(&mutex_lua)
+#define UNLOCK_LUA pthread_mutex_unlock(&mutex_lua)
 
 static volatile int work=0x7fffffff;
 
@@ -300,6 +314,72 @@ buf[n]=0;
 if(!do_fork) fprintf(stderr,"%s",buf);
  else syslog(prio,"%s",buf);
 }
+
+/* ---------------- LUA API  ------------------------------------------------- */
+
+static void lua_init(void) {
+int r;
+LOCK_LUA;
+do {
+	if(lLUA && lua_init_ok) break;
+	if(!luascript) break;
+	if(!luaconf) break;
+	if(!lLUA) {
+			lLUA = luaL_newstate( );
+    		if(lLUA) luaL_openlibs( lLUA );
+	}
+
+	if(!lLUA) break;
+
+	if(!!(r = luaL_dofile (lLUA,luascript))) {
+		fprintf(stderr,"%s\n", lua_tostring( lLUA, -1 ));
+		break;
+	}
+	lua_getglobal(lLUA, "load_rooms");
+	lua_pushstring(lLUA,luaconf);
+	lua_call(lLUA,1,1);
+	lua_init_ok = lua_tointeger( lLUA, -1 );
+	if(luadebug)
+		fprintf(stderr,"load_rooms(%s): %d\n",luaconf,lua_init_ok);
+} while(0);
+UNLOCK_LUA;
+}
+
+static int get_room_info(char *ip,char *buf,size_t len) {
+int ret = 0;
+buf[0] = 0;
+LOCK_LUA;
+if(lLUA && lua_init_ok) {
+
+	lua_getglobal(lLUA, "get_room");
+	lua_pushstring(lLUA,ip);
+	lua_call(lLUA,1,1);
+	strncpy(buf,lua_tostring(lLUA, -1),len);
+	ret = 1;
+	lua_pop(lLUA,1);
+	if(luadebug)
+		fprintf(stderr,"get_room_info(%s): %s\n",ip,buf);
+} else {
+	if(luadebug)
+		fprintf(stderr,"get_room_info(%s): faled\n",ip);
+}
+UNLOCK_LUA;
+return ret;
+}
+
+static void lua_done(void) {
+LOCK_LUA;
+do {
+	if(lLUA) {
+			lua_close(lLUA);
+			lLUA = NULL;
+	}
+} while(0);
+lua_init_ok = 0;
+
+UNLOCK_LUA;
+}
+
 
 /* ---------------- netdev index  ------------------------------------------------- */
 
@@ -778,20 +858,31 @@ void change_tree(time_t current_time,time_t last_tm) {
 
 static void free_ip4_dst (void *d,void *x) {
 struct ip4_dst *t = d;
+char ip_buf[INET_ADDRSTRLEN];
+char buf[64];
 FILE *Acct = (FILE *)x;
 	t->addr.s_addr = htonl(t->addr.s_addr);
-	fprintf(Acct,"DST %s %" PRIu64 " %" PRIu64 " %u %u %s\n",
-			inet_ntoa(t->addr),t->bsrc,t->bdst,t->psrc,t->pdst,bind_dscr[t->intf]);
+	inet_ntop(AF_INET,(void *)&t->addr,ip_buf,sizeof(ip_buf));	
+	if(!get_room_info(ip_buf,buf,sizeof(buf)-1))
+		buf[0] = 0;
+
+	fprintf(Acct,"DST %s %" PRIu64 " %" PRIu64 " %u %u %s%s\n",
+			ip_buf,t->bsrc,t->bdst,t->psrc,t->pdst,bind_dscr[t->intf],buf);
 	free((char *)d);
 }
 
 static void free_ip6_dst (void *d,void *x) {
 struct ip6_dst *t = d;
 char ip6_buf[INET6_ADDRSTRLEN];
+char buf[64];
 FILE *Acct = (FILE *)x;
-	fprintf(Acct,"DST %s %" PRIu64 " %" PRIu64 " %u %u %s\n",
-			inet_ntop(AF_INET6,(void *)&t->addr,ip6_buf,sizeof(ip6_buf)),
-			t->bsrc,t->bdst,t->psrc,t->pdst,bind_dscr[t->intf]);
+	inet_ntop(AF_INET6,(void *)&t->addr,ip6_buf,sizeof(ip6_buf));	
+	if(!get_room_info(ip6_buf,buf,sizeof(buf)-1))
+		buf[0] = 0;
+
+	fprintf(Acct,"DST %s %" PRIu64 " %" PRIu64 " %u %u %s%s\n",
+			ip6_buf,
+			t->bsrc,t->bdst,t->psrc,t->pdst,bind_dscr[t->intf],buf);
 	free((char *)d);
 }
 
@@ -908,8 +999,10 @@ while(a) {
 	a = n;
 }
 if(dst) {
+	lua_init();
     dst->avl_param = (void *)Acct;
     avl_destroy(dst,free_ip4_dst);
+	lua_done();
 }
 	
 }
@@ -982,8 +1075,10 @@ while(a) {
 	a = n;
 }
 if(dst) {
+	lua_init();
     dst->avl_param = (void *)Acct;
     avl_destroy(dst,free_ip6_dst);
+	lua_done();
 }
 	
 }
@@ -1741,12 +1836,33 @@ while(!feof(f)) {
 		debug= strtol(p,NULL,0);
 		continue;
 	}
+	if(!strcmp(c,"luascript")) {
+		p = strtok(NULL,"\r\n");
+		if(!p) return 1;
+		if(luascript)
+			fprintf(stderr,"replace luascript!\n");
+		luascript = strdup(p);
+		continue;
+	}
+	if(!strcmp(c,"luaconf")) {
+		p = strtok(NULL,"\r\n");
+		if(!p) return 1;
+		if(luaconf)
+			fprintf(stderr,"replace luaconf!\n");
+		luaconf = strdup(p);
+		continue;
+	}
+	if(!strcmp(c,"luadebug")) {
+		p = strtok(NULL,"\r\n");
+		if(!p) return 1;
+		luadebug = atoi(p);
+		continue;
+	}
 	return 1;
 }
 fclose(f);
 return 0;
 }
-
 
 void ndpi_init(void) {
 char l_buf[256],*l,*col[4];
@@ -1815,6 +1931,8 @@ int clidebug = 0;
 	}
 	init_netdev();
 	ndpi_init();
+	lua_init();
+	lua_done();
 	bzero((char *)&bind_addr,sizeof(bind_addr));
 	bind_addr.sin_family = AF_INET;
 
