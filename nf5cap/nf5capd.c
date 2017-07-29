@@ -101,6 +101,12 @@ struct flow_src {
 	struct flow_src *next;
 };
 
+struct dstonly_list {
+	struct in_addr	ip,mask;
+	struct dstonly_list *next;
+} *dst_ip = NULL;
+
+
 #define MAX_INTF 8
 char bind_dscr[MAX_INTF][16]={
 		"none",
@@ -143,21 +149,22 @@ struct ip6_rec {
 }; // 84 bytes
 
 struct ip4_dst {
-	u_int64_t	bsrc,bdst;
-	u_int32_t	psrc,pdst;
-	struct in_addr	addr;
-	int		intf;
+	u_int64_t	bsrc,bdst;	// 16
+	u_int32_t	psrc,pdst;	// 8
+	struct in_addr	addr;	// 4
+	short int intf,no_detail; //4
 };
 
 struct ip6_dst {
-	u_int64_t	bsrc,bdst;
-	u_int32_t	psrc,pdst;
-	struct in6_addr	addr;
-	int		intf;
+	struct in6_addr	addr;	//16
+	u_int64_t	bsrc,bdst;	//16
+	u_int32_t	psrc,pdst;	//8
+	int		intf;			//4
 };
 
 struct rec_tree {
 	struct avl_table *tree;
+	struct avl_table *dst;
 	struct ip4_rec *head,*last;
 	u_int32_t	npak;
 	u_int64_t	pcnt;
@@ -736,6 +743,15 @@ for(n = local_ip; n; n = n->next) {
 return 0;
 }
 
+int dst_ip4_addr(u_int32_t addr) {
+struct dstonly_list *n;
+if(!addr || addr == 0xffffffff || addr == 0x100007f) return 0;
+for(n = dst_ip; n; n = n->next) {
+	if((addr & n->mask.s_addr) == n->ip.s_addr) return 1; 
+}
+return 0;
+}
+
 static __INLINE__ int local_ip4_exclude_addr(u_int32_t addr) {
 struct ip_list *n;
 if(!addr || addr == 0xffffffff || addr == 0x100007f) return 1;
@@ -837,6 +853,7 @@ void change_tree(time_t current_time,time_t last_tm) {
 	current_dump.npak = 0;
 	current_dump.pcnt = 0;
 	current_dump.head = current_dump.last = NULL;
+	current_dump.dst = NULL;
 	current_dump.start_time = current_time;
 	current_dump.last_time = last_tm;
 	current_dump.dump_time = last_tm+16;
@@ -915,16 +932,50 @@ static __INLINE__ void swap_ip6_rec(ip6_rec_t *a)
         XSWAP(a->psrc, a->pdst, ta, u_int32_t)
         XSWAP(a->ptsrc,a->ptdst, tp, u_int16_t)
 }
+void process_dst(struct avl_table *dst, struct ip4_rec *a, int intf) {
 
-void avl_dump_ip4_rec(struct ip4_rec *a,FILE *Acct)
+struct ip4_dst *d;
+void **p;
+
+	d = malloc(sizeof(*d));
+	if(!d) return;
+
+	d->addr.s_addr = a->dst.s_addr;
+	d->intf = intf;
+	d->psrc = a->psrc;
+	d->pdst = a->pdst;
+	d->bsrc = a->bsrc;
+	d->bdst = a->bdst;
+	p = avl_probe(dst,d);
+	if(p) {
+		if(*p != d) {
+			free(d);
+			d = *p;
+			d->psrc += a->psrc;
+			d->pdst += a->pdst;
+			d->bsrc += a->bsrc;
+			d->bdst += a->bdst;
+		}
+		d = NULL;
+	}
+	if(d) free(d);
+}
+
+void avl_dump_ip4_rec(struct rec_tree *st,
+				FILE *Acct)
 {
 char bs[32],bd[32],bn[32],bp[64],flags[32],dir[4];
 char buf[192];
 struct ip4_rec *n;
-struct ip4_dst *d;
 int intf;
+struct ip4_rec *a = st->head;
+struct avl_table *dst;
 
-struct avl_table *dst = avl_create(compare_ip4_dst,NULL,NULL);
+if(st->dst) {
+		dst = st->dst;
+		st->dst = NULL;
+} else
+		dst = avl_create(compare_ip4_dst,NULL,NULL);
 
 while(a) {
 	
@@ -972,29 +1023,8 @@ while(a) {
 		a->psrc,a->pdst,
 		flags, bn, bind_dscr[intf],bp,dir);
 	fputs(buf,Acct);
-	d = malloc(sizeof(*d));
-	if(d && dst) {
-		void **p;
-		d->addr.s_addr = htonl(a->dst.s_addr);
-		d->intf = intf;
-		d->psrc = a->psrc;
-		d->pdst = a->pdst;
-		d->bsrc = a->bsrc;
-		d->bdst = a->bdst;
-		p = avl_probe(dst,d);
-		if(p) {
-			if(*p != d) {
-				free(d);
-				d = *p;
-				d->psrc += a->psrc;
-				d->pdst += a->pdst;
-				d->bsrc += a->bsrc;
-				d->bdst += a->bdst;
-			}
-			d = NULL;
-		}
-		if(d) free(d);
-	}
+	a->dst.s_addr = htonl(a->dst.s_addr);
+	process_dst(dst,a,intf);
 	n = a->next;
 	a = n;
 }
@@ -1114,6 +1144,20 @@ void add_info_ip4_rec(struct rec_tree *dump,struct ip4_rec *a)
 {
 struct ip4_rec *p;
 void **f;
+
+	if(dst_ip4_addr(htonl(a->dst.s_addr)) ) {
+		if(!dump->dst)
+			dump->dst = avl_create(compare_ip4_dst,NULL,NULL);
+
+		if(dump->dst) {
+			int intf = a->iif != 0xffff ? bind_dev(get_intf_byidx(a->iif)):0;
+			if(!intf && a->oif != 0xffff )
+				intf = bind_dev(get_intf_byidx(a->oif));
+			process_dst(dump->dst,a,intf);
+		}
+		return;
+	}
+
 	p = get_store_ip4_rec();
 	if(!p) return;
 	*p = *a;
@@ -1123,7 +1167,7 @@ void **f;
 		return;
 	}
 	dump->pcnt += a->psrc + a->pdst;
-        if (*f != p) {
+    if (*f != p) {
 		put_store_ip4_rec(p);
 		add_count_ip4(*f,a);
 	} else {
@@ -1227,7 +1271,7 @@ void process_dump_rec(struct rec_tree *st)
 			(unsigned long int)st->npak,
 			(unsigned long int)st->start_time,
 			(unsigned long int)st->last_time);
-		avl_dump_ip4_rec(st->head,Acct);
+		avl_dump_ip4_rec(st,Acct);
 		fclose(Acct);
 		if(get_next_event(0,&acct_name,LogDirName) < 0) {
 			ulog_syslog(LOG_ERR,"get_next_event error\n");
@@ -1294,7 +1338,8 @@ struct rec_tree *st = param;
 process_dump_rec(st);
 
 LOCK_STORE;
-avl_destroy(st->tree,put_ip4_rec);
+if(st->tree) avl_destroy(st->tree,put_ip4_rec);
+if(st->dst) avl_destroy(st->dst,free_ip4_dst);
 UNLOCK_STORE;
 
 free(st);
@@ -1321,7 +1366,7 @@ return NULL;
 
 void dump_old_rec(int thread)
 {
-	if(old_dump.tree && old_dump.head) {
+	if((old_dump.tree  && old_dump.head) || old_dump.dst) {
 		do {
 		    if(thread) {
 				pthread_t  th_dumper;
@@ -1332,20 +1377,23 @@ void dump_old_rec(int thread)
 				if(pthread_create(&th_dumper,NULL,dump_helper,(void *)st)) break;
 				pthread_detach(th_dumper);
 				old_dump.tree = NULL;
+				old_dump.dst = NULL;
 		    } else
 				process_dump_rec(&old_dump);
 		} while(0);
 	
-		if(old_dump.tree) {
-			LOCK_STORE;
+		LOCK_STORE;
+		if(old_dump.tree) 
 			avl_destroy(old_dump.tree,put_ip4_rec);
-			UNLOCK_STORE;
-		}
+		if(old_dump.dst) 
+			avl_destroy(old_dump.dst,free_ip4_dst);
+		
 		old_dump.npak = 0;
 		old_dump.head = NULL;
 		old_dump.last = NULL;
 		old_dump.tree = NULL;
-	
+		old_dump.dst  = NULL;
+		UNLOCK_STORE;
 	}
 }
 
@@ -1432,6 +1480,7 @@ static void add_record(struct rec_tree *dump,netflow_v5_record_t *n) {
 		}
 		ra.flags = a.flags ^ (NF_DIR|NF_REV);
 	}
+
 
 	add_info_ip4_rec(dump,sla ? &ra:&a);
 }
@@ -1646,6 +1695,27 @@ while(!feof(f)) {
 		if(!p) return 1;
 		if(!bind_addr.sin_port) {
 			bind_addr.sin_port = htons(atoi(p));
+		}
+		continue;
+	}
+	if(!strcmp(c,"no_detail_ip")) {
+		while ((p = strtok(NULL," \t\r\n")) != NULL) {
+			struct dstonly_list il,*n;
+			int i;
+			c = strchr(p,'/');
+			if(c) *c++ = 0;
+			if(!inet_aton(p,&il.ip)) return 1;
+			if(c) {
+				i = atoi(c);
+				if(i < 0 || i > 32) return 1;
+			} else  i=32;
+			n = (void *)malloc(sizeof(il));
+			if(!n) return 1;
+			bzero((char *)n,sizeof(*n));
+			n->ip = il.ip;
+			n->mask.s_addr = htonl(0xfffffffful << (32 - i));
+			n->next = dst_ip;
+			dst_ip = n;
 		}
 		continue;
 	}
@@ -2092,7 +2162,7 @@ int clidebug = 0;
 
 		if(!ndpi_init_ok) ndpi_init();
 		LOCK_DUMP;
-		if(old_dump.tree && old_dump.head && tm_tmp >= old_dump.dump_time) {
+		if(((old_dump.tree && old_dump.head) || old_dump.dst ) && tm_tmp >= old_dump.dump_time) {
 			dump_old_rec(1);
 			tm_tmp = time(NULL);
 		}
@@ -2175,11 +2245,11 @@ int clidebug = 0;
 	alarm(0);
 	if(!ndpi_init_ok) ndpi_init();
 	LOCK_DUMP;
-	if(old_dump.tree && old_dump.head) {
+	if((old_dump.tree && old_dump.head) || old_dump.dst) {
 		ulog_syslog(LOG_INFO,"Write old data\n");
 		dump_old_rec(0);
 	}
-	if(current_dump.tree && current_dump.head) {
+	if((current_dump.tree && current_dump.head) || current_dump.dst) {
 		old_dump = current_dump;
 		ulog_syslog(LOG_INFO,"Write new data\n");
 		dump_old_rec(0);
