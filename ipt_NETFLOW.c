@@ -5431,7 +5431,7 @@ do_protocols:
 		ct = nf_ct_get(skb, &ctinfo);
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(4,12,0)
 		// for nf_ct_is_untracked()
-		if(ctinfo == IP_CT_UNTRACKED)
+		if(!ct || ctinfo == IP_CT_UNTRACKED)
 # else
 		if(!ct || (ct && nf_ct_is_untracked(ct)))
 # endif
