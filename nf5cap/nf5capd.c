@@ -323,6 +323,22 @@ if(!do_fork) fprintf(stderr,"%s",buf);
 }
 
 /* ---------------- LUA API  ------------------------------------------------- */
+static int lAbort (lua_State *L) {
+	const char* err = lua_tostring(lLUA, 1);
+	fprintf(stderr,"lAbort: Error:%s\n", err);
+#if 0
+	lua_getglobal(lLUA, "debug"); // stack: err debug
+	lua_getfield(lLUA, -1, "traceback"); // stack: err debug debug.traceback
+
+	// debug.traceback() возвращает 1 значение
+	if(!lua_pcall(lLUA, 0, 1, 0)) {
+		const char* stackTrace = lua_tostring(lLUA, -1);
+
+		fprintf(stderr,"C stack traceback: %s\n", stackTrace);
+	}
+#endif
+	return 1;
+}
 
 static void lua_init(void) {
 int r;
@@ -342,10 +358,16 @@ do {
 		fprintf(stderr,"%s\n", lua_tostring( lLUA, -1 ));
 		break;
 	}
+	lua_pushcfunction(lLUA, lAbort);
 	lua_getglobal(lLUA, "load_rooms");
 	lua_pushstring(lLUA,luaconf);
-	lua_call(lLUA,1,1);
-	lua_init_ok = lua_tointeger( lLUA, -1 );
+	r = lua_pcall(lLUA,1,1,1);
+	if(!r) {
+		lua_init_ok = lua_tointeger( lLUA, -1 );
+		lua_pop(lLUA,1);
+	} else {
+		lua_pop(lLUA,2);
+	}
 	if(luadebug)
 		fprintf(stderr,"load_rooms(%s): %d\n",luaconf,lua_init_ok);
 } while(0);
@@ -358,14 +380,21 @@ buf[0] = 0;
 LOCK_LUA;
 if(lLUA && lua_init_ok) {
 
+	lua_pushcfunction(lLUA, lAbort);
 	lua_getglobal(lLUA, "get_room");
 	lua_pushstring(lLUA,ip);
-	lua_call(lLUA,1,1);
-	strncpy(buf,lua_tostring(lLUA, -1),len);
-	ret = 1;
-	lua_pop(lLUA,1);
-	if(luadebug)
-		fprintf(stderr,"get_room_info(%s): %s\n",ip,buf);
+	ret = lua_pcall(lLUA,1,1,1);
+	if(!ret) {
+		strncpy(buf,lua_tostring(lLUA, -1),len);
+		ret = 1;
+		lua_pop(lLUA,1);
+		if(luadebug)
+			fprintf(stderr,"get_room_info(%s): %s\n",ip,buf);
+	} else {
+		lua_pop(lLUA,2);
+		if(luadebug)
+			fprintf(stderr,"get_room_info(%s): faled\n",ip);
+	}
 } else {
 	if(luadebug)
 		fprintf(stderr,"get_room_info(%s): faled\n",ip);
