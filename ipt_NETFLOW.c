@@ -4748,6 +4748,8 @@ netflow_target_check(const struct xt_tgchk_param *par)
 	const char *tablename = par->table;
 	const struct xt_target *target = par->target;
 	const struct netflow_net *n = netflow_pernet(par->net);
+	int ret;
+
 	if (strcmp("nat", tablename) == 0) {
 		/* In the nat table we only see single packet per flow, which is useless. */
 		printk(KERN_ERR "%s target: is not valid in %s table\n", target->name, tablename);
@@ -4757,8 +4759,24 @@ netflow_target_check(const struct xt_tgchk_param *par)
 		printk(KERN_ERR "ip6tables NETFLOW target is meaningful for protocol 9 or 10 only.\n");
 		return CHECK_FAIL;
 	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+        ret = nf_ct_netns_get(par->net, par->family);
+        if (ret < 0) {
+                pr_info("cannot load conntrack support for "
+                        "address family %u\n", par->family);
+                return ret;
+        }
+#endif
 	return CHECK_OK;
 }
+
+static void netflow_target_destroy(const struct xt_tgdtor_param *par)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+        nf_ct_netns_put(par->net, par->family);
+#endif
+}
+
 
 #define SetXBit(x) (0x8000 >> (x)) /* Proper bit for htons later. */
 static inline __u16 observed_hdrs(const __u8 currenthdr)
@@ -5522,6 +5540,7 @@ static struct ipt_target ipt_netflow_reg[] __read_mostly = {
 		.name		= "NETFLOW",
 		.target		= netflow_target,
 		.checkentry	= netflow_target_check,
+		.destroy	= netflow_target_destroy,
 		.family		= AF_INET,
 		.hooks		=
 		       	(1 << NF_IP_PRE_ROUTING) |
@@ -5535,6 +5554,7 @@ static struct ipt_target ipt_netflow_reg[] __read_mostly = {
 		.name		= "NETFLOW",
 		.target		= netflow_target,
 		.checkentry	= netflow_target_check,
+		.destroy	= netflow_target_destroy,
 		.family		= AF_INET6,
 		.hooks		=
 		       	(1 << NF_IP_PRE_ROUTING) |
