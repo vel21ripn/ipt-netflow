@@ -4678,9 +4678,15 @@ static void netflow_work_fn(struct work_struct *work)
 #define CALC_RATE(ewma, cur, minutes) ewma += _A(cur - ewma, minutes)
 
 // calculate EWMA throughput rate for whole module
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static void rate_timer_calc(struct timer_list *t)
+{
+	struct netflow_net *n = from_timer(n, t, rate_timer);
+#else
 static void rate_timer_calc(unsigned long dummy)
 {
 	struct netflow_net *n = (struct netflow_net *)dummy;
+#endif
 	u64 searched = 0;
 	u64 found = 0;
 	u64 notfound = 0;
@@ -5757,7 +5763,12 @@ static int __net_init netflow_net_init(struct net *net)
 #endif
 	netflow_switch_version(n,n->protocol);
 	_schedule_scan_worker(n,0);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	timer_setup(&n->rate_timer, rate_timer_calc, 0);
+#else
 	setup_timer(&n->rate_timer, rate_timer_calc, (unsigned long)n);
+#endif
 	mod_timer(&n->rate_timer, jiffies + (HZ * SAMPLERATE));
 
 	n->peakflows_at = jiffies;
