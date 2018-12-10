@@ -1059,6 +1059,7 @@ static int nf_seq_show(struct seq_file *seq, void *v)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
 static int nf_seq_open(struct inode *inode, struct file *file)
 {
 	return single_open_net(inode, file, nf_seq_show);
@@ -1084,6 +1085,7 @@ static struct file_operations snmp_seq_fops = {
 	.llseek	 = seq_lseek,
 	.release = single_release_net,
 };
+#endif
 
 static inline int inactive_needs_export(const struct ipt_netflow *nf, const long i_timeout,
     const unsigned long jiff);
@@ -5699,15 +5701,25 @@ static int __net_init netflow_net_init(struct net *net)
 		printk(KERN_ERR "%s Unable to create ipt_neflow_hash\n",str_id);
 		goto err_hash;
 	}
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	if (!proc_create_net_single("ipt_netflow",S_IRUGO, net->proc_net_stat,
+				nf_seq_show,n)) {
+		goto err_free_hash;
+	}
+	if (!proc_create_net_single("ipt_netflow_snmp",S_IRUGO, net->proc_net_stat,
+				snmp_seq_show,n)) {
+		goto err_free_proc_stat1;
+	}
+#else
 	if (!register_stat(net->proc_net_stat,"ipt_netflow", &nf_seq_fops, n)) {
 		printk(KERN_ERR "%s Unable to create net/ipt_netflow\n",str_id);
-		goto err_free_netflow_slab;
+		goto err_free_hash;
 	}
 	if (!register_stat(net->proc_net_stat,"ipt_netflow_snmp", &snmp_seq_fops, n)) {
 		printk(KERN_ERR "%s Unable to create net/ipt_netflow_snmp\n",str_id);
 		goto err_free_proc_stat1;
 	}
+#endif
 	if (!register_stat(net->proc_net_stat,"ipt_netflow_flows", &flows_seq_fops, n)) {
 		printk(KERN_ERR "%s Unable to create net/ipt_netflow_flows\n",str_id);
 		goto err_free_proc_stat2;
@@ -5792,7 +5804,7 @@ err_free_proc_stat2:
 	remove_proc_entry("ipt_netflow_snmp", net->proc_net_stat);
 err_free_proc_stat1:
 	remove_proc_entry("ipt_netflow", net->proc_net_stat);
-err_free_netflow_slab:
+err_free_hash:
 #endif
 	vfree(n->htable);
 err_hash:
